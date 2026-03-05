@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -Eeou pipefail
 
-# InvestNet dVPN Node Management Script (Native Version)
-# - Supports the native nested structure: ~/.investnet-dvpnx/wireguard/config.toml
-# - Handles dynamic interface detection (e.g., ens5 on AWS)
-# - Corrects configuration validation errors (Raw IP only for remote-addrs)
+# ============================================================================
+# InvestNet dVPN Node
+# ============================================================================
+# Single script to install, initialize, start, stop, and uninstall the node.
+# - Auto-installs WireGuard packages if missing
+# - Downloads architecture-aware binary (amd64/arm64)
+# - SDK manages its own WireGuard 
+# - Handles dynamic egress interface detection
+# ============================================================================
 
 # --- Configuration Constants ---
 NODE_DIR="${HOME}/.investnet-dvpnx"
@@ -23,21 +28,74 @@ DENOM="invst"
 # Intervals
 NODE_INTERVAL_SESSION_USAGE_SYNC_WITH_BLOCKCHAIN="540s"
 NODE_INTERVAL_SESSION_VALIDATE="60s"
-NODE_INTERVAL_STATUS_UPDATE="15s"
+NODE_INTERVAL_STATUS_UPDATE="240s"
 
 # --- Utility Functions ---
 log() { echo "[INFO] $(date +'%Y-%m-%d %H:%M:%S') - $*"; }
 err() { echo "[ERROR] $(date +'%Y-%m-%d %H:%M:%S') - $*" >&2; }
 
+# Ensure running as root (needed for wg-quick, systemd, iptables)
+check_root() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        err "This script must be run as root (or with sudo)."
+        exit 1
+    fi
+}
+
+# Detect CPU architecture and return the binary suffix
+detect_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  echo "linux-amd64" ;;
+        aarch64) echo "linux-arm64" ;;
+        armv7l)  echo "linux-arm64" ;;
+        *)       err "Unsupported architecture: $arch"; exit 1 ;;
+    esac
+}
+
+# Install WireGuard packages if not already present
+install_wireguard_packages() {
+    if command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; then
+        log "WireGuard already installed, skipping."
+        return
+    fi
+
+    log "Installing WireGuard packages..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        apt-get install -y -qq wireguard wireguard-tools resolvconf 2>/dev/null || \
+        apt-get install -y -qq wireguard wireguard-tools 2>/dev/null
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y wireguard-tools
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y wireguard-tools
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm wireguard-tools
+    else
+        err "Could not detect package manager. Please install wireguard and wireguard-tools manually."
+        exit 1
+    fi
+
+    # Open UDP port in UFW if present
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow ${WG_PORT}/udp >/dev/null 2>&1 || true
+    fi
+    # Open UDP port in firewalld if present
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --add-port=${WG_PORT}/udp --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+
+    log "WireGuard installed successfully."
+}
+
+# Check all required dependencies are available
 check_deps() {
-    local deps=("curl" "jq" "openssl" "ip" "wg" "wg-quick" "sed" "awk" "python3" "fuser")
+    local deps=("curl" "openssl" "ip" "wg" "wg-quick" "sed" "awk")
     for dep in "${deps[@]}"; do
         if ! command -v "$dep" >/dev/null 2>&1; then
-            # Special check for fuser which might be in /sbin or /usr/sbin
-            if [[ "$dep" == "fuser" ]] && [[ -f "/sbin/fuser" || -f "/usr/sbin/fuser" ]]; then
-                continue
-            fi
-            err "Missing dependency: $dep. Please install it (e.g., sudo apt install psmisc)."
+            err "Missing dependency: $dep"
             exit 1
         fi
     done
@@ -45,8 +103,9 @@ check_deps() {
 
 detect_public_ip() {
     local ip
-    ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || curl -fsSL --max-time 5 https://icanhazip.com 2>/dev/null || true)
-    # Strip protocol and port
+    ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || \
+         curl -fsSL --max-time 5 https://icanhazip.com 2>/dev/null || \
+         curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)
     echo "$ip" | tr -d '[:space:]' | sed -E 's|^https?://||' | sed 's/:.*//'
 }
 
@@ -59,46 +118,89 @@ detect_egress_interface() {
     echo "$iface"
 }
 
+# Enable IP forwarding (persisted across reboots)
+enable_ip_forward() {
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    # Persist for reboots
+    if [[ ! -f /etc/sysctl.d/99-investnet-vpn.conf ]]; then
+        echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-investnet-vpn.conf
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+}
+
+# Download the latest binary for the correct architecture
+download_binary() {
+    local arch_suffix
+    arch_suffix=$(detect_arch)
+
+    log "Detected architecture: ${arch_suffix}"
+    log "Downloading latest binary from GitHub..."
+
+    local download_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}-${arch_suffix}"
+    local fallback_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}"
+
+    # Try architecture-specific binary first, fallback to generic name
+    if curl -fsSL "$download_url" -o "$BINARY_PATH" 2>/dev/null; then
+        log "Downloaded architecture-specific binary (${arch_suffix})."
+    elif curl -fsSL "$fallback_url" -o "$BINARY_PATH" 2>/dev/null; then
+        log "Downloaded binary (generic)."
+    else
+        err "Failed to download binary from GitHub. Check your internet connection."
+        exit 1
+    fi
+
+    chmod +x "$BINARY_PATH"
+    log "Binary installed at ${BINARY_PATH}"
+}
+
 # --- Command Implementations ---
 
 cmd_init() {
-    log "Initializing InvestNet dVPN Node (Native Structure)..."
+    log "Initializing InvestNet dVPN Node..."
+    check_root
+
+    # 1. Install WireGuard if needed
+    install_wireguard_packages
     check_deps
 
-    # 1. Always download the latest binary from GitHub
-    log "Downloading latest binary from GitHub..."
-    local download_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}"
-    sudo curl -fsSL "$download_url" -o "$BINARY_PATH"
-    sudo chmod +x "$BINARY_PATH"
-    log "Binary downloaded successfully."
+    # 2. Download latest binary
+    download_binary
 
-    local BIN="$BINARY_PATH"
-
-    # 2. Prepare Directories
+    # 3. Prepare Directories
     mkdir -p "${NODE_DIR}/wireguard"
 
-    # 3. Detect Settings
+    # 4. Detect Settings
     local pub_ip
     pub_ip=$(detect_public_ip)
     if [[ -z "$pub_ip" ]]; then
         read -p "Could not auto-detect public IP. Please enter it: " pub_ip
     fi
+    log "Detected public IP: ${pub_ip}"
 
     local moniker="node-$(openssl rand -hex 4)"
     read -p "Enter node moniker (default: $moniker): " user_moniker
     moniker="${user_moniker:-$moniker}"
 
-    # 4. Pricing
+    # 5. Pricing (integer only, max 6 digits)
     read -p "Enter hourly price in $DENOM (default: 1): " HOURLY_INPUT
     HOURLY_INPUT="${HOURLY_INPUT:-1}"
-    HOURLY_QUOTE=$(python3 -c "print(int(${HOURLY_INPUT} * 10**18))")
-    
+    if ! [[ "$HOURLY_INPUT" =~ ^[0-9]{1,6}$ ]]; then
+        err "Invalid hourly price: must be a whole number (no decimals), max 6 digits"
+        exit 1
+    fi
+    # Calculate token amount (multiply by 10^18) without python3
+    local HOURLY_QUOTE="${HOURLY_INPUT}000000000000000000"
+
     local gigabyte_prices="${DENOM}:20.0,20000000000000000000"
     local hourly_prices="${DENOM}:${HOURLY_INPUT},${HOURLY_QUOTE}"
 
-    # 5. Initialize Node Config
+    # 6. Enable IP forwarding (persisted)
+    enable_ip_forward
+
+    # 7. Initialize Node Config
     log "Running node init..."
-    "$BIN" init \
+    "$BINARY_PATH" init \
         --force \
         --home "$NODE_DIR" \
         --node.moniker "$moniker" \
@@ -116,21 +218,21 @@ cmd_init() {
         --node.interval-status-update "$NODE_INTERVAL_STATUS_UPDATE" \
         --tx.gas-prices "1000000000${DENOM}"
 
-    # 6. Initialize Keys
+    # 8. Initialize Keys
     log "Initializing account keys..."
     local account_name="main"
     read -p "Enter account name (default: $account_name): " user_account
     account_name="${user_account:-$account_name}"
-    "$BIN" keys add "$account_name" --home "$NODE_DIR" --keyring.backend "$KEYRING_BACKEND" --keyring.name "$KEYRING_NAME"
+    "$BINARY_PATH" keys add "$account_name" --home "$NODE_DIR" --keyring.backend "$KEYRING_BACKEND" --keyring.name "$KEYRING_NAME"
 
-    # 7. Update from_name in config.toml
+    # 9. Update from_name in config.toml
     if [[ -f "${NODE_DIR}/config.toml" ]]; then
         sed -i -E "s/^[[:space:]]*from_name = .*/from_name = \"${account_name}\"/" "${NODE_DIR}/config.toml"
     fi
 
-    # 8. Generate WireGuard keys and config
+    # 10. Generate WireGuard keys and config
     local wg_config_toml="${NODE_DIR}/wireguard/config.toml"
-    log "Creating Native WireGuard service config..."
+    log "Creating WireGuard service config..."
     local priv_key=$(wg genkey)
     local iface=$(detect_egress_interface)
 
@@ -143,54 +245,56 @@ out_interface = "${iface}"
 EOF
 
     log "Initialization complete!"
-    echo "=========================================================="
-    echo "IMPORTANT: SAVE YOUR MNEMONIC SAFELY!"
-    echo "Make sure your account has balance before starting."
-    echo "=========================================================="
+    echo ""
+    echo "=========================================================================="
+    echo "  IMPORTANT: SAVE YOUR MNEMONIC SAFELY!"
+    echo "  Make sure your account has balance before running: $0 start"
+    echo "=========================================================================="
 }
 
 cmd_start() {
     log "Starting InvestNet dVPN Node..."
-    check_deps
-    
+    check_root
+
     if [[ ! -f "${NODE_DIR}/config.toml" ]]; then
-        err "Node not initialized. Run 'init' first."
+        err "Node not initialized. Run '$0 init' first."
         exit 1
     fi
 
-    # 1. Stop service before updating files to avoid systemd warnings
-    sudo systemctl stop investnet-dvpn-node.service 2>/dev/null || true
-    sudo systemctl stop wg-quick@wg0 2>/dev/null || true
-    sudo wg-quick down wg0 2>/dev/null || true
-    sudo ip link del wg0 2>/dev/null || true
+    # 1. Clean up any existing WireGuard state
+    systemctl stop investnet-dvpn-node.service 2>/dev/null || true
+    systemctl stop wg-quick@wg0 2>/dev/null || true
+    wg-quick down wg0 2>/dev/null || true
+    ip link del wg0 2>/dev/null || true
 
-    # 2. Force free port 51820 (WireGuard)
+    # 2. Free WireGuard port
     log "Enforcing port ${WG_PORT} for WireGuard..."
-    sudo fuser -k ${WG_PORT}/udp 2>/dev/null || true
+    fuser -k ${WG_PORT}/udp 2>/dev/null || true
 
-    # 3. Sync Settings
+    # 3. Ensure IP forwarding is enabled
+    enable_ip_forward
+
+    # 4. Sync Settings (public IP and egress interface may change)
     local pub_ip=$(detect_public_ip)
     local iface=$(detect_egress_interface)
 
-    log "Syncing configuration..."
-    # Update main config (IP only)
-    sed -i -E "s/^remote-addrs = .*/remote-addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml"
-    sed -i -E "s/^remote_addrs = .*/remote_addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml"
+    log "Syncing configuration (IP: ${pub_ip}, interface: ${iface})..."
+    sed -i -E "s/^remote-addrs = .*/remote-addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
+    sed -i -E "s/^remote_addrs = .*/remote_addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
 
-    # Update WG service config (Port and Interface)
+    # Update WG service config
     if [[ -f "${NODE_DIR}/wireguard/config.toml" ]]; then
-        log "Updating wireguard config with port ${WG_PORT} and interface ${iface}"
         sed -i -E "s/^port = .*/port = \"${WG_PORT}\"/" "${NODE_DIR}/wireguard/config.toml"
         sed -i -E "s/^out_interface = .*/out_interface = \"${iface}\"/" "${NODE_DIR}/wireguard/config.toml"
     fi
 
-    # 4. Create Systemd Unit
+    # 5. Create Systemd Unit
     log "Setting up systemd service..."
-    local current_user=$(whoami)
-    local home_dir=$(eval echo "~$current_user")
-    local BIN=$(command -v "$BINARY_NAME" || echo "$BINARY_PATH")
+    local home_dir
+    home_dir=$(eval echo "~$(logname 2>/dev/null || whoami)")
+    local BIN=$(command -v "$BINARY_NAME" 2>/dev/null || echo "$BINARY_PATH")
 
-    sudo bash -c "cat > $SYSTEMD_UNIT" <<EOF
+    cat > "$SYSTEMD_UNIT" <<EOF
 [Unit]
 Description=InvestNet dVPN Node
 After=network-online.target
@@ -209,62 +313,136 @@ Environment=HOME=${home_dir}
 WantedBy=multi-user.target
 EOF
 
-    # 5. Start Service
-    sudo systemctl daemon-reload
-    sudo systemctl enable investnet-dvpn-node.service
-    log "Restarting service to apply configuration..."
-    sudo systemctl restart investnet-dvpn-node.service
+    # 6. Start Service
+    systemctl daemon-reload
+    systemctl enable investnet-dvpn-node.service >/dev/null 2>&1
+    log "Starting service..."
+    systemctl restart investnet-dvpn-node.service
 
-    log "Node started/restarted. Check status with './investnet-node.sh status'"
+    log "Node started. Check status with: $0 status"
 }
 
 cmd_status() {
-    sudo systemctl status investnet-dvpn-node.service --no-pager || true
-    echo "--- Recent Logs ---"
-    sudo journalctl -u investnet-dvpn-node.service -n 50 --no-pager
-    
-    # Wait a bit for the interface if it's missing (up to 5s)
-    echo "--- Interface Status ---"
+    echo "=== Service Status ==="
+    systemctl status investnet-dvpn-node.service --no-pager 2>/dev/null || echo "Service not found."
+
+    echo ""
+    echo "=== Recent Logs ==="
+    journalctl -u investnet-dvpn-node.service -n 30 --no-pager 2>/dev/null || true
+
+    echo ""
+    echo "=== WireGuard Interface ==="
     local count=0
-    while ! ip addr show wg0 >/dev/null 2>&1 && [ $count -lt 5 ]; do
+    while ! ip addr show wg0 >/dev/null 2>&1 && [[ $count -lt 3 ]]; do
         sleep 1
         ((count++))
     done
-    sudo ip addr show wg0 2>/dev/null || echo "Interface 'wg0' not found (may still be initializing)."
-    
-    echo "--- WireGuard Status ---"
-    sudo wg show || echo "WireGuard is not active or no interfaces found."
+    ip addr show wg0 2>/dev/null || echo "Interface 'wg0' not found (may still be initializing)."
+
+    echo ""
+    echo "=== WireGuard Peers ==="
+    wg show 2>/dev/null || echo "WireGuard is not active."
+
+    echo ""
+    echo "=== IP Forwarding ==="
+    sysctl net.ipv4.ip_forward 2>/dev/null || true
+
+    echo ""
+    echo "=== NAT Rules ==="
+    iptables -t nat -L POSTROUTING -n -v 2>/dev/null | grep -E "MASQUERADE|Chain" || echo "No NAT rules found."
 }
 
 cmd_stop() {
     log "Stopping node..."
-    sudo systemctl stop investnet-dvpn-node.service || true
-    sudo wg-quick down wg0 2>/dev/null || true
+    check_root
+    systemctl stop investnet-dvpn-node.service 2>/dev/null || true
+    wg-quick down wg0 2>/dev/null || true
+    log "Node stopped."
 }
 
 cmd_uninstall() {
-    read -p "Are you sure you want to uninstall everything? (y/N): " confirm
+    check_root
+    read -p "Are you sure you want to uninstall the node and all data? (y/N): " confirm
     if [[ "$confirm" != "y" ]]; then exit 0; fi
 
-    log "Uninstalling..."
+    log "Uninstalling InvestNet dVPN Node..."
+
+    # 1. Stop everything
     cmd_stop
-    sudo systemctl disable investnet-dvpn-node.service 2>/dev/null || true
-    sudo rm -f "$SYSTEMD_UNIT"
-    sudo systemctl daemon-reload
-    sudo rm -rf "$NODE_DIR"
-    log "Uninstalled successfully."
+
+    # 2. Disable and remove systemd service
+    systemctl disable investnet-dvpn-node.service 2>/dev/null || true
+    rm -f "$SYSTEMD_UNIT"
+    systemctl daemon-reload
+
+    # 3. Clean up WireGuard interface
+    ip link del wg0 2>/dev/null || true
+
+    # 4. Clean up iptables rules
+    local iface=$(detect_egress_interface)
+    iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i wg0 -o ${iface} -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i ${iface} -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -o ${iface} -j MASQUERADE 2>/dev/null || true
+    ip6tables -D FORWARD -i wg0 -o ${iface} -j ACCEPT 2>/dev/null || true
+    ip6tables -D FORWARD -i ${iface} -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    ip6tables -t nat -D POSTROUTING -o ${iface} -j MASQUERADE 2>/dev/null || true
+
+    # 5. Clean up nftables
+    nft delete rule ip wg-nat POSTROUTING oifname "${iface}" masquerade 2>/dev/null || true
+    nft list chains ip wg-nat >/dev/null 2>&1 && nft flush chain ip wg-nat POSTROUTING 2>/dev/null || true
+    nft list tables ip 2>/dev/null | grep -q wg-nat && nft delete table ip wg-nat 2>/dev/null || true
+
+    # 6. Revert DNS
+    if command -v resolvectl >/dev/null 2>&1; then
+        resolvectl revert wg0 2>/dev/null || true
+    fi
+
+    # 7. Close firewall ports
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow ${WG_PORT}/udp 2>/dev/null || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --remove-port=${WG_PORT}/udp --permanent 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+    fi
+
+    # 8. Remove node data
+    rm -rf "$NODE_DIR"
+
+    # 9. Remove binary
+    rm -f "$BINARY_PATH"
+
+    # 10. Remove sysctl config
+    rm -f /etc/sysctl.d/99-investnet-vpn.conf
+    sysctl --system >/dev/null 2>&1 || true
+
+    log "Uninstalled successfully. WireGuard packages are left installed."
+}
+
+cmd_help() {
+    echo ""
+    echo "InvestNet dVPN Node Management"
+    echo ""
+    echo "Usage: $0 {init|start|stop|restart|status|uninstall}"
+    echo ""
+    echo "Commands:"
+    echo "  init        Install dependencies, download binary, and initialize the node"
+    echo "  start       Start the node (creates systemd service)"
+    echo "  stop        Stop the node"
+    echo "  restart     Restart the node"
+    echo "  status      Show node status, logs, WireGuard info, and NAT rules"
+    echo "  uninstall   Stop node, remove service, data, and binary"
+    echo ""
 }
 
 # --- Dispatcher ---
 case "${1:-help}" in
-    init) cmd_init ;;
-    start) cmd_start ;;
-    stop) cmd_stop ;;
-    status) cmd_status ;;
-    restart) cmd_stop; cmd_start ;;
+    init)      cmd_init ;;
+    start)     cmd_start ;;
+    stop)      cmd_stop ;;
+    status)    cmd_status ;;
+    restart)   cmd_stop; cmd_start ;;
     uninstall) cmd_uninstall ;;
-    *)
-        echo "Usage: $0 {init|start|stop|status|restart|uninstall}"
-        exit 1
-        ;;
+    *)         cmd_help ;;
 esac
