@@ -139,17 +139,21 @@ download_binary() {
 
     local download_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}-${arch_suffix}"
     local fallback_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}"
+    local tmp_file="/tmp/${BINARY_NAME}.download.$$"
 
-    # Try architecture-specific binary first, fallback to generic name
-    if curl -fsSL "$download_url" -o "$BINARY_PATH" 2>/dev/null; then
+    # Download to /tmp first, then move to final location
+    if curl -fSL --connect-timeout 15 --max-time 300 "$download_url" -o "$tmp_file" 2>&1; then
         log "Downloaded architecture-specific binary (${arch_suffix})."
-    elif curl -fsSL "$fallback_url" -o "$BINARY_PATH" 2>/dev/null; then
+    elif curl -fSL --connect-timeout 15 --max-time 300 "$fallback_url" -o "$tmp_file" 2>&1; then
         log "Downloaded binary (generic)."
     else
+        rm -f "$tmp_file"
         err "Failed to download binary from GitHub. Check your internet connection."
         exit 1
     fi
 
+    # Move to final location
+    mv "$tmp_file" "$BINARY_PATH"
     chmod +x "$BINARY_PATH"
     log "Binary installed at ${BINARY_PATH}"
 }
