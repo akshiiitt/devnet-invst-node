@@ -142,10 +142,6 @@ enable_ip_forward() {
 
 # Download the latest binary for the correct architecture
 download_binary() {
-    if [[ -f "$BINARY_PATH" ]]; then
-        log "Binary already exists at ${BINARY_PATH}, skipping download for local testing."
-        return
-    fi
     local arch_suffix
     arch_suffix=$(detect_arch)
 
