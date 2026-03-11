@@ -28,7 +28,7 @@ DENOM="invst"
 # Intervals
 NODE_INTERVAL_SESSION_USAGE_SYNC_WITH_BLOCKCHAIN="540s"
 NODE_INTERVAL_SESSION_VALIDATE="60s"
-NODE_INTERVAL_STATUS_UPDATE="240s"
+NODE_INTERVAL_STATUS_UPDATE="30s"
 
 # --- Utility Functions ---
 log() { echo "[INFO] $(date +'%Y-%m-%d %H:%M:%S') - $*"; }
@@ -106,31 +106,46 @@ detect_public_ip() {
     ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null || \
          curl -fsSL --max-time 5 https://icanhazip.com 2>/dev/null || \
          curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)
-    echo "$ip" | tr -d '[:space:]' | sed -E 's|^https?://||' | sed 's/:.*//'
+    echo "$ip" | tr -d '[:space:]' | sed -E 's|^https?://||'
 }
 
 detect_egress_interface() {
     local iface
     iface=$(ip route get 1.1.1.1 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
     if [[ -z "$iface" ]]; then
+        iface=$(ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
+    fi
+    if [[ -z "$iface" ]]; then
         iface=$(ip route | awk '/^default/ {print $5; exit}')
+    fi
+    if [[ -z "$iface" ]]; then
+        iface=$(ip -6 route | awk '/^default/ {print $5; exit}')
     fi
     echo "$iface"
 }
 
-# Enable IP forwarding (persisted across reboots)
 enable_ip_forward() {
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
     # Persist for reboots
     if [[ ! -f /etc/sysctl.d/99-investnet-vpn.conf ]]; then
         echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-investnet-vpn.conf
+        echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-investnet-vpn.conf
         sysctl --system >/dev/null 2>&1 || true
+    else
+        if ! grep -q "net.ipv6.conf.all.forwarding" /etc/sysctl.d/99-investnet-vpn.conf; then
+            echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-investnet-vpn.conf
+            sysctl --system >/dev/null 2>&1 || true
+        fi
     fi
 }
 
 # Download the latest binary for the correct architecture
 download_binary() {
+    if [[ -f "$BINARY_PATH" ]]; then
+        log "Binary already exists at ${BINARY_PATH}, skipping download for local testing."
+        return
+    fi
     local arch_suffix
     arch_suffix=$(detect_arch)
 
@@ -220,7 +235,8 @@ cmd_init() {
         --node.interval-session-usage-sync-with-blockchain "$NODE_INTERVAL_SESSION_USAGE_SYNC_WITH_BLOCKCHAIN" \
         --node.interval-session-validate "$NODE_INTERVAL_SESSION_VALIDATE" \
         --node.interval-status-update "$NODE_INTERVAL_STATUS_UPDATE" \
-        --tx.gas-prices "1000000000${DENOM}"
+        --tx.gas-prices "1000000invst" \
+        --tx.gas-adjustment "1.6"
 
     # 8. Initialize Keys
     log "Initializing account keys..."
@@ -242,7 +258,7 @@ cmd_init() {
 
     cat > "$wg_config_toml" <<EOF
 ipv4_addr = "10.8.0.1/24"
-ipv6_addr = ""
+ipv6_addr = "fd08::1/120"
 port = "${WG_PORT}"
 private_key = "${priv_key}"
 out_interface = "${iface}"
@@ -385,6 +401,7 @@ cmd_uninstall() {
     # 4. Clean up iptables rules
     local iface=$(detect_egress_interface)
     iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
+    ip6tables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i wg0 -o ${iface} -j ACCEPT 2>/dev/null || true
     iptables -D FORWARD -i ${iface} -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o ${iface} -j MASQUERADE 2>/dev/null || true
