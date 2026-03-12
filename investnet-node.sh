@@ -28,7 +28,7 @@ DENOM="invst"
 # Intervals
 NODE_INTERVAL_SESSION_USAGE_SYNC_WITH_BLOCKCHAIN="540s"
 NODE_INTERVAL_SESSION_VALIDATE="60s"
-NODE_INTERVAL_STATUS_UPDATE="30s"
+NODE_INTERVAL_STATUS_UPDATE="25s"
 
 # --- Utility Functions ---
 log() { echo "[INFO] $(date +'%Y-%m-%d %H:%M:%S') - $*"; }
