@@ -80,10 +80,12 @@ install_wireguard_packages() {
     # Open UDP port in UFW if present
     if command -v ufw >/dev/null 2>&1; then
         ufw allow ${WG_PORT}/udp >/dev/null 2>&1 || true
+        ufw allow ${API_PORT}/tcp >/dev/null 2>&1 || true
     fi
     # Open UDP port in firewalld if present
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --add-port=${WG_PORT}/udp --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port=${API_PORT}/tcp --permanent >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
     fi
 
@@ -220,7 +222,7 @@ cmd_init() {
         --home "$NODE_DIR" \
         --node.moniker "$moniker" \
         --node.api-port "$API_PORT" \
-        --node.remote-addrs "${pub_ip}" \
+        --node.remote-addrs "${pub_ip}:${WG_PORT}" \
         --node.service-type "wireguard" \
         --node.gigabyte-prices "$gigabyte_prices" \
         --node.hourly-prices "$hourly_prices" \
@@ -246,19 +248,8 @@ cmd_init() {
         sed -i -E "s/^[[:space:]]*from_name = .*/from_name = \"${account_name}\"/" "${NODE_DIR}/config.toml"
     fi
 
-    # 10. Generate WireGuard keys and config
-    local wg_config_toml="${NODE_DIR}/wireguard/config.toml"
-    log "Creating WireGuard service config..."
-    local priv_key=$(wg genkey)
-    local iface=$(detect_egress_interface)
-
-    cat > "$wg_config_toml" <<EOF
-ipv4_addr = "10.8.0.1/24"
-ipv6_addr = "fd08::1/120"
-port = "${WG_PORT}"
-private_key = "${priv_key}"
-out_interface = "${iface}"
-EOF
+    # 10. (Removed) The SDK automatically generates WireGuard keys and config
+    # during the node run / setup phase.
 
     log "Initialization complete!"
     echo ""
@@ -277,11 +268,8 @@ cmd_start() {
         exit 1
     fi
 
-    # 1. Clean up any existing WireGuard state
+    # 1. Clean up any existing systemd instances
     systemctl stop investnet-dvpn-node.service 2>/dev/null || true
-    systemctl stop wg-quick@wg0 2>/dev/null || true
-    wg-quick down wg0 2>/dev/null || true
-    ip link del wg0 2>/dev/null || true
 
     # 2. Free WireGuard port
     log "Enforcing port ${WG_PORT} for WireGuard..."
@@ -295,13 +283,12 @@ cmd_start() {
     local iface=$(detect_egress_interface)
 
     log "Syncing configuration (IP: ${pub_ip}, interface: ${iface})..."
-    sed -i -E "s/^remote-addrs = .*/remote-addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
-    sed -i -E "s/^remote_addrs = .*/remote_addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
+    sed -i -E "s/^[[:space:]]*remote-addrs[[:space:]]*=.*/remote-addrs = [\"${pub_ip}:${WG_PORT}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
+    sed -i -E "s/^[[:space:]]*remote_addrs[[:space:]]*=.*/remote_addrs = [\"${pub_ip}:${WG_PORT}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
 
-    # Update WG service config
+    # Update WG service config with the correct interface
     if [[ -f "${NODE_DIR}/wireguard/config.toml" ]]; then
-        sed -i -E "s/^port = .*/port = \"${WG_PORT}\"/" "${NODE_DIR}/wireguard/config.toml"
-        sed -i -E "s/^out_interface = .*/out_interface = \"${iface}\"/" "${NODE_DIR}/wireguard/config.toml"
+        sed -i -E "s/^[[:space:]]*out_interface[[:space:]]*=.*/out_interface = \"${iface}\"/" "${NODE_DIR}/wireguard/config.toml"
     fi
 
     # 5. Create Systemd Unit
@@ -418,9 +405,11 @@ cmd_uninstall() {
     # 7. Close firewall ports
     if command -v ufw >/dev/null 2>&1; then
         ufw delete allow ${WG_PORT}/udp 2>/dev/null || true
+        ufw delete allow ${API_PORT}/tcp 2>/dev/null || true
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --remove-port=${WG_PORT}/udp --permanent 2>/dev/null || true
+        firewall-cmd --remove-port=${API_PORT}/tcp --permanent 2>/dev/null || true
         firewall-cmd --reload 2>/dev/null || true
     fi
 
