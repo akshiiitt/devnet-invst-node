@@ -28,7 +28,7 @@ DENOM="invst"
 # Intervals
 NODE_INTERVAL_SESSION_USAGE_SYNC_WITH_BLOCKCHAIN="540s"
 NODE_INTERVAL_SESSION_VALIDATE="60s"
-NODE_INTERVAL_STATUS_UPDATE="25s"
+NODE_INTERVAL_STATUS_UPDATE="20s"
 
 # --- Utility Functions ---
 log() { echo "[INFO] $(date +'%Y-%m-%d %H:%M:%S') - $*"; }
@@ -222,7 +222,7 @@ cmd_init() {
         --home "$NODE_DIR" \
         --node.moniker "$moniker" \
         --node.api-port "$API_PORT" \
-        --node.remote-addrs "${pub_ip}:${WG_PORT}" \
+        --node.remote-addrs "${pub_ip}" \
         --node.service-type "wireguard" \
         --node.gigabyte-prices "$gigabyte_prices" \
         --node.hourly-prices "$hourly_prices" \
@@ -283,8 +283,8 @@ cmd_start() {
     local iface=$(detect_egress_interface)
 
     log "Syncing configuration (IP: ${pub_ip}, interface: ${iface})..."
-    sed -i -E "s/^[[:space:]]*remote-addrs[[:space:]]*=.*/remote-addrs = [\"${pub_ip}:${WG_PORT}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
-    sed -i -E "s/^[[:space:]]*remote_addrs[[:space:]]*=.*/remote_addrs = [\"${pub_ip}:${WG_PORT}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
+    sed -i -E "s/^[[:space:]]*remote-addrs[[:space:]]*=.*/remote-addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
+    sed -i -E "s/^[[:space:]]*remote_addrs[[:space:]]*=.*/remote_addrs = [\"${pub_ip}\"]/" "${NODE_DIR}/config.toml" 2>/dev/null || true
 
     # Update WG service config with the correct interface
     if [[ -f "${NODE_DIR}/wireguard/config.toml" ]]; then
