@@ -43,14 +43,15 @@ check_root() {
 }
 
 # Detect CPU architecture and return the binary suffix
+# ONLY Raspberry Pi (ARM) is supported
 detect_arch() {
     local arch
     arch=$(uname -m)
     case "$arch" in
-        x86_64)  echo "linux-amd64" ;;
         aarch64) echo "linux-arm64" ;;
         armv7l)  echo "linux-arm64" ;;
-        *)       err "Unsupported architecture: $arch"; exit 1 ;;
+        x86_64)  err "This script is designed for Raspberry Pi only. x86_64/amd64 architecture is not supported."; exit 1 ;;
+        *)       err "Unsupported architecture: $arch. Only Raspberry Pi (ARM/ARM64) is supported."; exit 1 ;;
     esac
 }
 
@@ -151,24 +152,17 @@ download_binary() {
     log "Downloading latest binary from GitHub..."
 
     local download_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}-${arch_suffix}"
-    local fallback_url="https://github.com/${BINARY_REPO}/releases/latest/download/${BINARY_NAME}"
-    local tmp_file="/tmp/${BINARY_NAME}.download.$$"
 
-    # Download to /tmp first, then move to final location
-    if curl -fSL --connect-timeout 15 --max-time 300 "$download_url" -o "$tmp_file" 2>&1; then
-        log "Downloaded architecture-specific binary (${arch_suffix})."
-    elif curl -fSL --connect-timeout 15 --max-time 300 "$fallback_url" -o "$tmp_file" 2>&1; then
-        log "Downloaded binary (generic)."
+    # Download ARM binary directly to location (Raspberry Pi only)
+    if curl -fSL --connect-timeout 15 --max-time 300 "$download_url" -o "$BINARY_PATH" 2>&1; then
+        chmod +x "$BINARY_PATH"
+        log "Downloaded Raspberry Pi binary (${arch_suffix})."
+        log "Binary installed at ${BINARY_PATH}"
     else
-        rm -f "$tmp_file"
-        err "Failed to download binary from GitHub. Check your internet connection."
+        rm -f "$BINARY_PATH"
+        err "Failed to download Raspberry Pi binary from GitHub. Check your internet connection."
         exit 1
     fi
-
-    # Move to final location
-    mv "$tmp_file" "$BINARY_PATH"
-    chmod +x "$BINARY_PATH"
-    log "Binary installed at ${BINARY_PATH}"
 }
 
 # --- Command Implementations ---
@@ -199,13 +193,32 @@ cmd_init() {
     read -p "Enter node moniker (default: $moniker): " user_moniker
     moniker="${user_moniker:-$moniker}"
 
-    # 5. Pricing (integer only, max 6 digits)
-    read -p "Enter hourly price in $DENOM (default: 1): " HOURLY_INPUT
-    HOURLY_INPUT="${HOURLY_INPUT:-1}"
-    if ! [[ "$HOURLY_INPUT" =~ ^[0-9]{1,6}$ ]]; then
-        err "Invalid hourly price: must be a whole number (no decimals), max 6 digits"
-        exit 1
-    fi
+    # 5. Pricing (integer only, min 1, max 6 digits)
+    while true; do
+        read -p "Enter hourly price in $DENOM (min: 1, max: 999999, default: 1): " HOURLY_INPUT
+        HOURLY_INPUT="${HOURLY_INPUT:-1}"
+        
+        # Check if it's a valid integer with no decimals
+        if ! [[ "$HOURLY_INPUT" =~ ^[0-9]+$ ]]; then
+            err "Invalid input: must be a whole number (no decimals, no letters)"
+            continue
+        fi
+        
+        # Check if it's within range (1 to 999999)
+        if [[ "$HOURLY_INPUT" -lt 1 ]]; then
+            err "Price too low: minimum is 1 $DENOM"
+            continue
+        fi
+        
+        if [[ "$HOURLY_INPUT" -gt 999999 ]]; then
+            err "Price too high: maximum is 999999 $DENOM (6 digits)"
+            continue
+        fi
+        
+        # Valid input, break the loop
+        log "Hourly price set to: $HOURLY_INPUT $DENOM"
+        break
+    done
     # Calculate token amount (multiply by 10^18) without python3
     local HOURLY_QUOTE="${HOURLY_INPUT}000000000000000000"
 
